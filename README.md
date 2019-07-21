@@ -1,0 +1,1 @@
+# bolha-lambda-image-compressoor
