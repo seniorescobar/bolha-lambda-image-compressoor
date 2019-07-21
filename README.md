@@ -1,1 +1,1 @@
-# bolha-lambda-image-compressoor
+# bolha-lambda-image-compressor
