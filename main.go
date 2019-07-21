@@ -13,16 +13,100 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
-
-	"github.com/seniorescobar/bolha/lambda/common"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	apiHost = "api.tinify.com"
+	apiHost        = "api.tinify.com"
+	s3ImagesBucket = "bolha-images"
 )
+
+var (
+	s3d *s3manager.Downloader
+	s3u *s3manager.Uploader
+)
+
+func Handler(ctx context.Context, event events.S3Event) error {
+	sess := session.Must(session.NewSession())
+
+	s3d = s3manager.NewDownloader(sess)
+	s3u = s3manager.NewUploader(sess)
+
+	tac := NewTinyAPIClient(os.Getenv("TINYAPIKEY"))
+
+	for _, record := range event.Records {
+		s3Obj := record.S3.Object
+
+		imgKey := s3Obj.Key
+
+		log.WithFields(log.Fields{
+			"imgKey": imgKey,
+		}).Info("downloading image")
+
+		img, err := downloadS3Image(imgKey)
+		if err != nil {
+			return err
+		}
+
+		loc, err := tac.CompressImage(img)
+		if err != nil {
+			return err
+		}
+
+		imgNew, err := tac.ResizeCompressedImage(loc)
+		if err != nil {
+			return err
+		}
+		defer imgNew.Close()
+
+		if err := uploadS3Image(strings.Replace(imgKey, "_uncompressed.jpg", ".jpg", 1), imgNew); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// HELPERS
+
+func downloadS3Image(imgKey string) (io.Reader, error) {
+	log.WithField("imgKey", imgKey).Info("downloading image from s3")
+
+	buff := new(aws.WriteAtBuffer)
+
+	_, err := s3d.Download(buff, &s3.GetObjectInput{
+		Bucket: aws.String(s3ImagesBucket),
+		Key:    aws.String(imgKey),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	imgBytes := buff.Bytes()
+
+	return bytes.NewReader(imgBytes), nil
+}
+
+func uploadS3Image(imgKey string, img io.Reader) error {
+	log.WithField("imgKey", imgKey).Info("uploading image to s3")
+
+	if _, err := s3u.Upload(&s3manager.UploadInput{
+		Bucket: aws.String(s3ImagesBucket),
+		Key:    aws.String(imgKey),
+		Body:   img,
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TINYAPI
 
 type tinyAPIClient struct {
 	apiUsername, apiPassword string
@@ -79,12 +163,17 @@ func (tac *tinyAPIClient) CompressImage(img io.Reader) (string, error) {
 
 	var respJSON struct {
 		Input struct {
-			Size int    `json:"size"`
-			Type string `json:"type"`
+			Size int `json:"size"`
 		} `json:"input"`
+		Output struct {
+			Size int `json:"size"`
+		} `json:"output"`
 	}
 	json.Unmarshal(respBytes, &respJSON)
-	log.WithField("imgSizeCompressed", respJSON.Input.Size).Info("image compressed")
+	log.WithFields(log.Fields{
+		"imgInputSize":  respJSON.Input.Size,
+		"imgOutputSize": respJSON.Output.Size,
+	}).Info("image compressed")
 
 	loc, err := resp.Location()
 	if err != nil {
@@ -134,49 +223,6 @@ func (tac *tinyAPIClient) ResizeCompressedImage(loc string) (io.ReadCloser, erro
 	}).Info("compressed image resized")
 
 	return resp.Body, nil
-}
-
-func Handler(ctx context.Context, event events.S3Event) error {
-	log.Info("compressing images")
-
-	sess := session.Must(session.NewSession())
-
-	s3Client := common.NewS3Client(sess)
-
-	tac := NewTinyAPIClient(os.Getenv("TINYAPIKEY"))
-
-	for _, record := range event.Records {
-		s3Obj := record.S3.Object
-
-		imgKey, imgSize := s3Obj.Key, s3Obj.Size
-
-		log.WithFields(log.Fields{
-			"imgKey":  imgKey,
-			"imgSize": imgSize,
-		}).Info("downloading image")
-
-		img, err := s3Client.DownloadImage(imgKey)
-		if err != nil {
-			return err
-		}
-
-		loc, err := tac.CompressImage(img)
-		if err != nil {
-			return err
-		}
-
-		imgNew, err := tac.ResizeCompressedImage(loc)
-		if err != nil {
-			return err
-		}
-		defer imgNew.Close()
-
-		if err := s3Client.UploadImage(strings.Replace(imgKey, "_uncompressed.jpg", "_compressed.jpg", 1), imgNew); err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 func main() {
